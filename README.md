@@ -47,13 +47,11 @@ neuron-models/
 ## How to Run
 
 ```bash
-pip install numpy matplotlib scipy
+pip install numpy matplotlib scipy sklearn
 
-# Hodgkin-Huxley
-python hodgkin_huxley/hh_model.py
+# Hodgkin-Huxley and Izhikevich
+python HH_Izhikevich.py
 
-# Izhikevich
-python izhikevich/izh_model.py
 ```
 
 Plots are saved automatically to the respective `plots/` folders.
