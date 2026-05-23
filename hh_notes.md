@@ -1,3 +1,5 @@
+# Neuron models
+
 # Hodgkin-Huxley Model — Notes
 
 ## What is it?
@@ -89,3 +91,105 @@ The exponents (m³, n⁴) are empirical — they came from fitting the experimen
 | `E_Na` | 50 mV | Na⁺ reversal potential |
 | `E_K` | -77 mV | K⁺ reversal potential |
 | `E_L` | -54.4 mV | Leak reversal potential |
+
+# Izhikevich Model — Notes
+
+## What is it?
+
+A simplified neuron model proposed by Eugene Izhikevich in 2003. The goal was to find the minimal model that could still reproduce the rich diversity of firing patterns seen in real cortical neurons — without the computational cost of Hodgkin-Huxley.
+
+Paper: *"Simple Model of Spiking Neurons"* — IEEE Transactions on Neural Networks, 2003.
+
+---
+
+## The Core Idea
+
+Where Hodgkin-Huxley has 4 variables and models actual ion channels, Izhikevich collapses everything into 2 variables:
+
+```
+dv/dt = 0.04v² + 5v + 140 - u + I
+du/dt = a(bv - u)
+```
+
+With a **reset condition** — when `v` reaches +30 mV (the spike peak):
+```
+if v >= 30:
+    v = c
+    u = u + d
+```
+
+That's it. Two ODEs and four parameters (a, b, c, d).
+
+---
+
+## What Each Variable Represents
+
+| Variable | Meaning |
+|----------|---------|
+| `v` | Membrane potential (mV) |
+| `u` | Membrane recovery variable — a slow negative feedback on `v` |
+
+`u` is an abstraction — it roughly captures the combined effect of K⁺ activation and Na⁺ inactivation from HH, but without modelling the channels explicitly.
+
+---
+
+## The Four Parameters
+
+| Parameter | Role |
+|-----------|------|
+| `a` | Time scale of the recovery variable `u` (smaller = slower recovery) |
+| `b` | Sensitivity of `u` to subthreshold voltage fluctuations |
+| `c` | After-spike reset value of `v` |
+| `d` | After-spike reset increment of `u` |
+
+By tuning these four values, the model can reproduce over 20 different neuron types.
+
+---
+
+## Firing Pattern Examples
+
+| Neuron Type | a | b | c | d |
+|------------|---|---|---|---|
+| Regular Spiking (RS) | 0.02 | 0.2 | -65 | 8 |
+| Intrinsically Bursting (IB) | 0.02 | 0.2 | -55 | 4 |
+| Chattering (CH) | 0.02 | 0.2 | -50 | 2 |
+| Fast Spiking (FS) | 0.1 | 0.2 | -65 | 2 |
+| Low-threshold Spiking (LTS) | 0.02 | 0.25 | -65 | 2 |
+
+---
+
+## The Engineering Insight
+
+This is essentially a **trade-off analysis** — a concept that maps directly to ECE thinking:
+
+- HH: high biological fidelity, high compute cost
+- Izhikevich: lower fidelity, ~1000x more computationally efficient, still qualitatively accurate
+
+For simulating large networks (thousands of neurons), HH becomes infeasible. Izhikevich makes it tractable.
+
+---
+
+## Why the Quadratic Term?
+
+The `0.04v²` term is what gives the model its spike-generating mechanism. It creates a saddle-node bifurcation — the voltage is stable at rest, but once pushed past threshold, it rapidly diverges (the spike). After the reset, `u` brings it back.
+
+This is a phenomenological model — it captures the *behaviour* of a spike without modelling the underlying ionic mechanisms.
+
+---
+
+## My Observations from the Simulation
+
+*(Fill this in — which firing patterns did you try? Did changing parameters do what you expected? What was surprising?)*
+
+---
+
+## Comparison with Hodgkin-Huxley
+
+| Property | Hodgkin-Huxley | Izhikevich |
+|----------|---------------|------------|
+| Variables | 4 (V, m, h, n) | 2 (v, u) |
+| Biological basis | Ion channels | Phenomenological |
+| Firing patterns | ~1 (basic spiking) | 20+ |
+| Compute cost | High | Very low |
+| Best use case | Single neuron accuracy | Large network simulation |
+
