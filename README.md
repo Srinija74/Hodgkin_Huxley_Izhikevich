@@ -50,7 +50,7 @@ neuron-models/
 pip install numpy matplotlib scipy sklearn
 
 # Hodgkin-Huxley and Izhikevich
-python HH_Izhikevich.py
+python hh_izhikevich.py
 
 ```
 
