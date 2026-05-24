@@ -1,369 +1,354 @@
-# -*- coding: utf-8 -*-
 """
 hh_izhikevich.py
 ================
-Computational simulation and derivation of the Hodgkin-Huxley (1952) and
-Izhikevich (2003) neuron models, demonstrating the mathematical reduction
-from a 4-dimensional biophysical system to a 2-dimensional phenomenological
-model via quasi-static approximation, Rinzel reduction, and Taylor expansion
-at the saddle-node bifurcation point.
-
-Dependencies:
-    numpy, matplotlib, scipy, scikit-learn
-
-Usage:
-    python hh_izhikevich.py
-
-Plots are saved to the 'plots/' directory (created automatically).
-
-Author  : Srinija
-Date    : 2026
+Demonstrates the step-by-step reduction of the Hodgkin-Huxley (1952) model
+from 4D to 2D, and compares the resulting 2D reduced system with the
+phenomenological Izhikevich (2003) model.
+ 
+Reduction pipeline
+------------------
+  4D  →  3D : quasi-static approximation  m ≈ m_∞(V)   (τ_m ≪ τ_h, τ_n)
+  3D  →  2D : Rinzel (1985) reduction     h ≈ φ(n)      (fitted from HH trajectory)
+  2D system : state = (V, n), exact HH kinetics for dn/dt
+ 
+Izhikevich comparison
+---------------------
+The canonical 0.04v²+5v+140 parabola is Izhikevich's own phenomenological
+choice — it cannot be algebraically derived from HH because the V-nullcline
+of the 2D reduced system is S-shaped (R²≈0.50 for a quadratic fit).
+The Izhikevich model is therefore presented as a parallel phenomenological
+model, not as an analytic consequence of the reduction.
 """
-
-import os
-import warnings
-
+ 
+import matplotlib
+matplotlib.use("Agg")
+ 
+import os, warnings
 os.makedirs("plots", exist_ok=True)
 warnings.filterwarnings("ignore")
-
+ 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
 from sklearn.linear_model import LinearRegression
-
+ 
 plt.rcParams.update({"figure.dpi": 120, "font.size": 11})
-
-
+ 
+# ── colour palette ────────────────────────────────────────────────────────────
+C_HH  = "black"
+C_2D  = "#e05c2a"   # burnt orange — 2-D reduced
+C_IZH = "#2a7ae0"   # steel blue   — Izhikevich
+C_NC  = "#2ca02c"   # green        — nullclines
+ 
+ 
 # =============================================================================
-# Section 1 — The Full Hodgkin-Huxley Model
+# Section 1 — HH parameters and rate functions
 # =============================================================================
-# The membrane equation:
-#
-#   C_m dV/dt = I - g_Na·m³h·(V-E_Na) - g_K·n⁴·(V-E_K) - g_L·(V-E_L)
-#
-# Each gating variable x ∈ {m, h, n} obeys:
-#
-#   dx/dt = α_x(V)·(1-x) - β_x(V)·x = [x_∞(V) - x] / τ_x(V)
+C_m  = 1.0;   g_Na = 120.0; g_K = 36.0; g_L = 0.3
+E_Na = 50.0;  E_K  = -77.0; E_L = -54.387
+ 
+def alpha_m(V): return 0.1*(V+40)/(1-np.exp(-(V+40)/10))
+def beta_m(V):  return 4.0*np.exp(-(V+65)/18)
+def alpha_h(V): return 0.07*np.exp(-(V+65)/20)
+def beta_h(V):  return 1.0/(1+np.exp(-(V+35)/10))
+def alpha_n(V): return 0.01*(V+55)/(1-np.exp(-(V+55)/10))
+def beta_n(V):  return 0.125*np.exp(-(V+65)/80)
+ 
+def x_inf(a, b, V): return a(V) / (a(V) + b(V))
+def tau_x(a, b, V): return 1.0  / (a(V) + b(V))
+ 
+ 
 # =============================================================================
-
-# ── Membrane and conductance parameters ──────────────────────────────────────
-C_m  = 1.0    # µF/cm²
-g_Na = 120.0  # mS/cm²
-g_K  = 36.0   # mS/cm²
-g_L  = 0.3    # mS/cm²
-E_Na = 50.0   # mV
-E_K  = -77.0  # mV
-E_L  = -54.387  # mV
-
-# ── Voltage-dependent rate functions ─────────────────────────────────────────
-def alpha_m(V): return 0.1 * (V + 40) / (1 - np.exp(-(V + 40) / 10))
-def beta_m(V):  return 4.0 * np.exp(-(V + 65) / 18)
-
-def alpha_h(V): return 0.07 * np.exp(-(V + 65) / 20)
-def beta_h(V):  return 1.0 / (1 + np.exp(-(V + 35) / 10))
-
-def alpha_n(V): return 0.01 * (V + 55) / (1 - np.exp(-(V + 55) / 10))
-def beta_n(V):  return 0.125 * np.exp(-(V + 65) / 80)
-
-def x_inf(alpha, beta, V): return alpha(V) / (alpha(V) + beta(V))
-def tau_x(alpha, beta, V): return 1.0 / (alpha(V) + beta(V))
-
-
-# ── Hodgkin-Huxley ODE system ─────────────────────────────────────────────────
-def hh_ode(t, y, I_ext):
+# Section 2 — Full 4D Hodgkin-Huxley simulation
+# =============================================================================
+def hh_ode(t, y, I_ext=10.0):
     V, m, h, n = y
-    I_Na = g_Na * m**3 * h * (V - E_Na)
-    I_K  = g_K  * n**4     * (V - E_K)
-    I_L  = g_L             * (V - E_L)
-    dV = (I_ext - I_Na - I_K - I_L) / C_m
-    dm = alpha_m(V) * (1 - m) - beta_m(V) * m
-    dh = alpha_h(V) * (1 - h) - beta_h(V) * h
-    dn = alpha_n(V) * (1 - n) - beta_n(V) * n
+    dV = (I_ext
+          - g_Na*m**3*h*(V-E_Na)
+          - g_K *n**4  *(V-E_K)
+          - g_L        *(V-E_L)) / C_m
+    dm = alpha_m(V)*(1-m) - beta_m(V)*m
+    dh = alpha_h(V)*(1-h) - beta_h(V)*h
+    dn = alpha_n(V)*(1-n) - beta_n(V)*n
     return [dV, dm, dh, dn]
-
-
-# ── Initial conditions and simulation ────────────────────────────────────────
-V0 = -65.0
-y0 = [
-    V0,
-    x_inf(alpha_m, beta_m, V0),
-    x_inf(alpha_h, beta_h, V0),
-    x_inf(alpha_n, beta_n, V0),
-]
-
-t = np.arange(0, 100, 0.01)
-sol = solve_ivp(
-    hh_ode, (0, 100), y0,
-    method="RK45", t_eval=t, max_step=0.025, args=(10.0,)
-)
-V_hh, m_hh, h_hh, n_hh = sol.y
-
-fig, axes = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
-axes[0].plot(t, V_hh, "k", lw=1.2)
-axes[0].set_ylabel("V (mV)")
-axes[0].set_title("Hodgkin–Huxley Simulation (I = 10 µA/cm²)")
-axes[1].plot(t, m_hh, label="m  (fast activation)")
-axes[1].plot(t, h_hh, label="h  (slow inactivation)")
-axes[1].plot(t, n_hh, label="n  (K⁺ activation)")
-axes[1].set_xlabel("Time (ms)")
-axes[1].set_ylabel("Gate value")
-axes[1].legend(ncol=3)
+ 
+V0  = -65.0
+y0  = [V0,
+       x_inf(alpha_m, beta_m, V0),
+       x_inf(alpha_h, beta_h, V0),
+       x_inf(alpha_n, beta_n, V0)]
+t   = np.arange(0, 100, 0.01)
+ 
+sol_hh = solve_ivp(hh_ode, (0,100), y0,
+                   method="RK45", t_eval=t, max_step=0.025, args=(10.0,))
+V_hh, m_hh, h_hh, n_hh = sol_hh.y
+ 
+n_spk_hh = int(np.sum((V_hh[1:]>0) & (V_hh[:-1]<=0)))
+print(f"[HH 4D]  spikes = {n_spk_hh}  V ∈ [{V_hh.min():.1f}, {V_hh.max():.1f}] mV")
+ 
+# ── Plot 1: HH action potential ───────────────────────────────────────────────
+fig, axes = plt.subplots(2, 1, figsize=(10,5), sharex=True)
+axes[0].plot(t, V_hh, C_HH, lw=1.2)
+axes[0].set_ylabel("V  (mV)")
+axes[0].set_title("Hodgkin–Huxley (4D)  —  I = 10 µA/cm²")
+axes[1].plot(t, m_hh, label="m  fast activation")
+axes[1].plot(t, h_hh, label="h  slow inactivation")
+axes[1].plot(t, n_hh, label="n  K⁺ activation")
+axes[1].set_xlabel("Time (ms)"); axes[1].set_ylabel("Gate value")
+axes[1].legend(ncol=3, fontsize=9)
 plt.tight_layout()
-plt.savefig("plots/01_hh_action_potential.png", dpi=150)
-plt.show()
-
-
+fig.savefig("plots/01_hh_action_potential.png", dpi=150); plt.close(fig)
+print("→ saved 01_hh_action_potential.png")
+ 
+ 
 # =============================================================================
-# Section 2 — Timescale Separation: Quasi-Static Approximation for m
+# Section 3 — Timescale separation: justify m ≈ m_∞(V)
 # =============================================================================
-# If τ_m ≪ τ_n, τ_h everywhere, then m equilibrates almost instantaneously
-# and can be replaced by the algebraic constraint m = m_∞(V), reducing the
-# system from 4D to 3D.
-# =============================================================================
-
 V_r = np.linspace(-80, 40, 500)
 tm = tau_x(alpha_m, beta_m, V_r)
 tn = tau_x(alpha_n, beta_n, V_r)
 th = tau_x(alpha_h, beta_h, V_r)
-
-print(f"τ_m  [{tm.min():.3f}, {tm.max():.3f}] ms  ← fast")
-print(f"τ_n  [{tn.min():.3f}, {tn.max():.3f}] ms")
-print(f"τ_h  [{th.min():.3f}, {th.max():.3f}] ms")
-print(f"\nmean τ_n / τ_m ≈ {np.mean(tn)/np.mean(tm):.0f}×  →  m ≈ m_∞(V) is valid")
-
+ 
+print(f"\n[Timescales]")
+print(f"  τ_m ∈ [{tm.min():.3f}, {tm.max():.3f}] ms  ← fastest")
+print(f"  τ_n ∈ [{tn.min():.3f}, {tn.max():.3f}] ms")
+print(f"  τ_h ∈ [{th.min():.3f}, {th.max():.3f}] ms")
+print(f"  mean τ_n/τ_m ≈ {np.mean(tn)/np.mean(tm):.0f}×  →  m ≈ m_∞(V) valid")
+ 
 fig, ax = plt.subplots(figsize=(8, 3.5))
-ax.semilogy(V_r, tm, label=r"$\tau_m$ (fast)", lw=2)
-ax.semilogy(V_r, tn, label=r"$\tau_n$",         lw=2)
-ax.semilogy(V_r, th, label=r"$\tau_h$",         lw=2)
-ax.set_xlabel("V (mV)")
-ax.set_ylabel("Time constant (ms, log scale)")
-ax.set_title("Gate Timescales — Justifying the Quasi-Static Approximation")
+ax.semilogy(V_r, tm, lw=2, label=r"$\tau_m$  (fast — eliminated)")
+ax.semilogy(V_r, tn, lw=2, label=r"$\tau_n$")
+ax.semilogy(V_r, th, lw=2, label=r"$\tau_h$")
+ax.set_xlabel("V (mV)"); ax.set_ylabel("Time constant (ms, log)")
+ax.set_title("Step 1: Gate timescales — justifying m ≈ m∞(V)  (4D → 3D)")
 ax.legend()
 plt.tight_layout()
-plt.savefig("plots/02_timescale_separation.png", dpi=150)
-plt.show()
-
-
+fig.savefig("plots/02_timescale_separation.png", dpi=150); plt.close(fig)
+print("→ saved 02_timescale_separation.png")
+ 
+ 
 # =============================================================================
-# Section 3 — Phase-Plane Reduction to 2D
+# Section 4 — Rinzel reduction: fit h ≈ φ(n) from HH trajectory  (3D → 2D)
 # =============================================================================
-# With m ≈ m_∞(V) the system is 3D: (V, h, n).  The Rinzel (1985) reduction
-# exploits the strong anti-correlation between h and n during spiking:
-#   h ≈ 0.89 − 1.1n
-# This yields a 2D system in (V, u) where u ≡ n serves as the single
-# slow recovery variable.
-# =============================================================================
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-# h–n anti-correlation
-sc = axes[0].scatter(n_hh[::10], h_hh[::10], s=2, alpha=0.3,
+reg_hn      = LinearRegression().fit(n_hh.reshape(-1,1), h_hh)
+h_slope     = reg_hn.coef_[0]
+h_int       = reg_hn.intercept_
+R2_hn       = reg_hn.score(n_hh.reshape(-1,1), h_hh)
+ 
+print(f"\n[Rinzel h–n fit from HH trajectory]")
+print(f"  h ≈ {h_slope:.4f}·n + {h_int:.4f}   R² = {R2_hn:.4f}")
+ 
+fig, axes = plt.subplots(1, 2, figsize=(12,4))
+ 
+sc = axes[0].scatter(n_hh[::10], h_hh[::10], s=2, alpha=0.4,
                      c=t[::10], cmap="viridis")
-axes[0].set_xlabel("n  (K⁺ activation gate)")
-axes[0].set_ylabel("h  (Na⁺ inactivation gate)")
-axes[0].set_title("h–n Anti-Correlation (Rinzel Reduction)")
+n_fit = np.linspace(n_hh.min(), n_hh.max(), 100)
+axes[0].plot(n_fit, h_slope*n_fit+h_int, "r", lw=2,
+             label=f"h = {h_slope:.3f}n + {h_int:.3f}  (R²={R2_hn:.3f})")
+axes[0].set_xlabel("n  (K⁺ activation)"); axes[0].set_ylabel("h  (Na⁺ inactivation)")
+axes[0].set_title("Step 2: h–n anti-correlation  (3D → 2D)")
+axes[0].legend(fontsize=9)
 fig.colorbar(sc, ax=axes[0], label="Time (ms)")
-
-# V–n phase portrait
-axes[1].plot(V_hh[::5], n_hh[::5], lw=0.5, alpha=0.6, color="steelblue")
-axes[1].set_xlabel("V (mV)")
-axes[1].set_ylabel("n")
-axes[1].set_title("Phase Portrait: the V–n Plane")
-
+ 
+axes[1].plot(V_hh[::5], n_hh[::5], lw=0.6, alpha=0.7, color="steelblue")
+axes[1].set_xlabel("V (mV)"); axes[1].set_ylabel("n")
+axes[1].set_title("HH trajectory in the V–n phase plane")
 plt.tight_layout()
-plt.savefig("plots/03_phase_plane.png", dpi=150)
-plt.show()
-
-
+fig.savefig("plots/03_rinzel_reduction.png", dpi=150); plt.close(fig)
+print("→ saved 03_rinzel_reduction.png")
+ 
+ 
 # =============================================================================
-# Section 4 — Taylor Expansion at the Saddle-Node Bifurcation
+# Section 5 — 2D reduced system
+#
+#   dV/dt = [I − g_Na·m_∞(V)³·(h_s·n+h_i)·(V−E_Na)
+#              − g_K·n⁴·(V−E_K) − g_L·(V−E_L)] / C_m
+#   dn/dt = α_n(V)·(1−n) − β_n(V)·n
+#
+# Both m and h are no longer ODEs — m is an algebraic function of V,
+# h is an algebraic function of n.  State vector is (V, n) only.
 # =============================================================================
-# At the bifurcation point V₀: f′(V₀) = 0  (the linear term vanishes).
-# Retaining the quadratic remainder:
-#   f(V) ≈ f(V₀) + f″(V₀)/2 · (V − V₀)²
-# This leads to the parabolic V-nullcline:
-#   u = c₀ + c₁V + c₂V²   with c₂ = f″(V₀)/2 > 0
-# In Izhikevich's canonical parameterisation: 0.04v² + 5v + 140.
+ 
+def reduced_2d(t, y, I_ext=10.0):
+    V, n = y
+    m   = x_inf(alpha_m, beta_m, V)
+    h   = np.clip(h_slope*n + h_int, 0.0, 1.0)
+    dV  = (I_ext
+           - g_Na*m**3*h*(V-E_Na)
+           - g_K *n**4  *(V-E_K)
+           - g_L        *(V-E_L)) / C_m
+    dn  = alpha_n(V)*(1-n) - beta_n(V)*n
+    return [dV, dn]
+ 
+y0_2d   = [V0, x_inf(alpha_n, beta_n, V0)]
+sol_2d  = solve_ivp(reduced_2d, (0,100), y0_2d,
+                    method="RK45", t_eval=t, max_step=0.025)
+V_2d, n_2d = sol_2d.y
+n_spk_2d = int(np.sum((V_2d[1:]>0) & (V_2d[:-1]<=0)))
+print(f"\n[2D reduced]  spikes = {n_spk_2d}  V ∈ [{V_2d.min():.1f}, {V_2d.max():.1f}] mV")
+ 
+ 
 # =============================================================================
-
-
+# Section 6 — Phase-plane nullclines of the 2D system
+#
+# V-nullcline: set dV/dt = 0, solve for n at each V  (numerical, brentq)
+# n-nullcline: dn/dt = 0  →  n = n_∞(V)             (analytic)
+#
+# The V-nullcline is S-shaped (2 turning points) — this is what gives the
+# system its excitable / oscillatory character.  A single parabola cannot
+# capture an S-curve, so R² of a quadratic fit stays ~0.50.
+# This is why the Izhikevich parabola is phenomenological, not derived.
 # =============================================================================
-# Section 5 — Fitting the Quadratic Nullcline to HH Data
-# =============================================================================
-
-# Steady-state V-nullcline: set dV/dt = 0 with all gates at steady state
-V_grid = np.linspace(-80, 40, 500)
-m_ss = x_inf(alpha_m, beta_m, V_grid)
-h_ss = x_inf(alpha_h, beta_h, V_grid)
-n_ss = x_inf(alpha_n, beta_n, V_grid)
-
-u_nullcline = (
-    g_Na * m_ss**3 * h_ss * (V_grid - E_Na)
-    + g_K  * n_ss**4       * (V_grid - E_K)
-    + g_L                  * (V_grid - E_L)
-)
-
-X   = np.column_stack([V_grid, V_grid**2])
-reg = LinearRegression().fit(X, u_nullcline)
-c0      = reg.intercept_
-c1, c2  = reg.coef_
-R2      = reg.score(X, u_nullcline)
-
-print(f"\nNullcline fit (HH units):")
-print(f"  c₀ = {c0:+.4f}   c₁ = {c1:+.4f}   c₂ = {c2:+.4f}   R² = {R2:.4f}")
-
-fig, ax = plt.subplots(figsize=(8, 4))
-ax.scatter(V_grid, u_nullcline, s=3, alpha=0.4,
-           label="HH steady-state nullcline", zorder=3)
-ax.plot(V_grid, c0 + c1 * V_grid + c2 * V_grid**2, "r", lw=2,
-        label=f"Quadratic fit  (R² = {R2:.3f})")
-ax.set_xlabel("V (mV)")
-ax.set_ylabel("I_ionic (µA/cm²)")
-ax.set_title("V-Nullcline: Steady-State HH vs. Quadratic Approximation")
-ax.legend()
+ 
+V_sw  = np.linspace(-80, 40, 400)
+n_Vn  = np.full_like(V_sw, np.nan)   # V-nullcline
+for i, V in enumerate(V_sw):
+    m = x_inf(alpha_m, beta_m, V)
+    def eq(n, V=V, m=m):
+        h = np.clip(h_slope*n + h_int, 0, 1)
+        return (10.0
+                - g_Na*m**3*h*(V-E_Na)
+                - g_K*n**4  *(V-E_K)
+                - g_L       *(V-E_L))
+    try:
+        n_Vn[i] = brentq(eq, 0.0, 1.0, xtol=1e-8)
+    except ValueError:
+        pass
+ 
+n_nn  = x_inf(alpha_n, beta_n, V_sw)   # n-nullcline
+ 
+# Quadratic fit to V-nullcline (shown to be limited)
+ok   = ~np.isnan(n_Vn)
+Vv, nv = V_sw[ok], n_Vn[ok]
+Xq   = np.column_stack([np.ones_like(Vv), Vv, Vv**2])
+cq,_,_,_ = np.linalg.lstsq(Xq, nv, rcond=None)
+R2_Vnull = 1 - np.sum((nv - Xq@cq)**2) / np.sum((nv - nv.mean())**2)
+print(f"\n[V-nullcline quadratic fit]  R² = {R2_Vnull:.4f}  "
+      f"← S-shaped curve, parabola is insufficient")
+ 
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+ 
+# Left: phase plane
+axes[0].plot(Vv, nv,     C_2D, lw=2.5, label="V-nullcline  (dV/dt = 0)")
+axes[0].plot(Vv, Xq@cq, "k--", lw=1.5,
+             label=f"Quadratic fit  R² = {R2_Vnull:.2f}")
+axes[0].plot(V_sw, n_nn, C_NC, lw=2.5, label="n-nullcline  (dn/dt = 0)")
+axes[0].plot(V_2d, n_2d, color="grey", lw=0.7, alpha=0.7, label="2D trajectory")
+axes[0].set_xlabel("V (mV)"); axes[0].set_ylabel("n")
+axes[0].set_title("Phase plane — 2D reduced system\n"
+                  "(V-nullcline is S-shaped → quadratic fit fails)")
+axes[0].legend(fontsize=9); axes[0].set_xlim(-82, 45); axes[0].set_ylim(0, 1)
+ 
+# Right: voltage traces
+axes[1].plot(t, V_hh, C_HH, lw=1.4, label=f"Full HH  (4D, {n_spk_hh} spikes)")
+axes[1].plot(t, V_2d, C_2D, lw=1.2, ls="--",
+             label=f"2D reduced  (m=m∞, h=φ(n), {n_spk_2d} spikes)")
+axes[1].set_xlabel("Time (ms)"); axes[1].set_ylabel("V (mV)")
+axes[1].set_title("Voltage trace: 4D HH  vs.  2D reduced")
+axes[1].legend(fontsize=9); axes[1].set_ylim(-85, 60)
 plt.tight_layout()
-plt.savefig("plots/04_nullcline_fit.png", dpi=150)
-plt.show()
-
-
+fig.savefig("plots/04_phase_plane_and_reduction.png", dpi=150); plt.close(fig)
+print("→ saved 04_phase_plane_and_reduction.png")
+ 
+ 
 # =============================================================================
-# Section 6 — The Izhikevich Model
-# =============================================================================
-# Replacing f(V) with the fitted parabola and writing u as a combined
-# recovery variable yields:
+# Section 7 — Izhikevich model (canonical phenomenological form)
 #
 #   dv/dt = 0.04v² + 5v + 140 − u + I
-#   du/dt = a·(bv − u)
+#   du/dt = a·(b·v − u)
+#   reset: if v ≥ 30  →  v ← c,  u ← u + d
 #
-# Reset rule:  if v ≥ 30 mV  →  v ← c,  u ← u + d
+# The parabola 0.04v²+5v+140 is Izhikevich's own choice — it places the
+# saddle-node bifurcation near −70 mV with threshold near −55 mV.
+# It is NOT algebraically derivable from HH via the reduction above.
 # =============================================================================
-
-# Rescale fitted HH nullcline coefficients to Izhikevich canonical form
-k_scale = c2 / 0.04
-a2 = c2 / k_scale   # → 0.04
-a1 = c1 / k_scale   # → ~5
-a0 = c0 / k_scale   # → ~140
-
-print("\nRescaled Izhikevich nullcline coefficients:")
-print(f"  a2  (canonical ~0.04)  = {a2:.4f}")
-print(f"  a1  (canonical ~5)     = {a1:.4f}")
-print(f"  a0  (canonical ~140)   = {a0:.4f}")
-print(f"\n  Scale factor k = {k_scale:.4f}")
-print(f"  Canonical : 0.04v² + 5v + 140")
-print(f"  Derived   : {a2:.4f}v² + {a1:.4f}v + {a0:.4f}")
-
-
-def izhikevich(a, b, c_reset, d, I_ext=10, T=200, dt=0.1):
-    """
-    Simulate the Izhikevich neuron model using nullcline coefficients
-    derived from the Hodgkin-Huxley fit (a2, a1, a0).
-
-    Parameters
-    ----------
-    a       : float  — recovery time scale
-    b       : float  — subthreshold coupling of u to v
-    c_reset : float  — post-spike reset voltage (mV)
-    d       : float  — post-spike recovery increment
-    I_ext   : float  — applied current (µA/cm²)
-    T       : float  — simulation duration (ms)
-    dt      : float  — time step (ms)
-
-    Returns
-    -------
-    t, v, u : ndarrays — time, membrane potential, recovery variable
-    spikes  : list    — spike times (ms)
-    """
-    t      = np.arange(0, T, dt)
-    v      = np.full(len(t), -65.0)
-    u      = np.full(len(t), b * -65.0)
-    spikes = []
-
-    for i in range(1, len(t)):
-        v[i] = v[i-1] + dt * (a2 * v[i-1]**2 + a1 * v[i-1] + a0
-                               - u[i-1] + I_ext)
-        u[i] = u[i-1] + dt * (a * (b * v[i-1] - u[i-1]))
+ 
+def izhikevich(a, b, c_reset, d, I_ext=10.0, T=200.0, dt=0.1):
+    t_iz = np.arange(0, T, dt)
+    v    = np.full(len(t_iz), -65.0)
+    u    = np.full(len(t_iz),  b * -65.0)
+    spks = []
+    for i in range(1, len(t_iz)):
+        v[i] = v[i-1] + dt*(0.04*v[i-1]**2 + 5*v[i-1] + 140 - u[i-1] + I_ext)
+        u[i] = u[i-1] + dt*(a*(b*v[i-1] - u[i-1]))
         if v[i] >= 30:
-            v[i-1] = 30
-            v[i]   = c_reset
-            u[i]  += d
-            spikes.append(t[i])
-
-    return t, v, u, spikes
-
-
+            v[i]  = c_reset     # reset only current step (no trace corruption)
+            u[i] += d
+            spks.append(t_iz[i])
+    return t_iz, v, u, spks
+ 
 neuron_types = {
-    "Regular Spiking (RS)":          dict(a=0.02, b=0.2,  c_reset=-65, d=8),
-    "Intrinsically Bursting (IB)":   dict(a=0.02, b=0.2,  c_reset=-55, d=4),
-    "Fast Spiking (FS)":             dict(a=0.1,  b=0.2,  c_reset=-65, d=2),
-    "Low-Threshold Spiking (LTS)":   dict(a=0.02, b=0.25, c_reset=-65, d=2),
+    "Regular Spiking (RS)":        dict(a=0.02, b=0.2,  c_reset=-65, d=8),
+    "Intrinsically Bursting (IB)": dict(a=0.02, b=0.2,  c_reset=-55, d=4),
+    "Fast Spiking (FS)":           dict(a=0.1,  b=0.2,  c_reset=-65, d=2),
+    "Low-Threshold Spiking (LTS)": dict(a=0.02, b=0.25, c_reset=-65, d=2),
 }
-
-fig, axes = plt.subplots(2, 2, figsize=(13, 7), sharex=True)
+ 
+fig, axes = plt.subplots(2, 2, figsize=(13,7), sharex=True)
 for ax, (name, params) in zip(axes.flat, neuron_types.items()):
-    t_iz, v_iz, u_iz, spks = izhikevich(**params)
-    ax.plot(t_iz, v_iz, "k", lw=0.9)
-    ax.set_title(name, fontsize=10)
-    ax.set_ylabel("v (mV)")
-    ax.set_ylim(-90, 45)
-    fr = len(spks) / 0.2 if spks else 0
+    t_iz, v_iz, _, spks = izhikevich(**params)
+    ax.plot(t_iz, v_iz, C_IZH, lw=0.9)
+    ax.set_title(name, fontsize=10); ax.set_ylabel("v (mV)"); ax.set_ylim(-90, 45)
+    fr = len(spks) / 0.2
     ax.text(0.97, 0.97, f"{fr:.0f} Hz",
-            transform=ax.transAxes, ha="right", va="top",
-            fontsize=9, color="steelblue")
-for ax in axes[1]:
-    ax.set_xlabel("Time (ms)")
-fig.suptitle(
-    f"Izhikevich Model — Derived from HH Nullcline Fit\n"
-    f"(a2 = {a2:.4f},  a1 = {a1:.4f},  a0 = {a0:.4f})",
-    fontsize=11,
-)
+            transform=ax.transAxes, ha="right", va="top", fontsize=9, color=C_IZH)
+for ax in axes[1]: ax.set_xlabel("Time (ms)")
+fig.suptitle("Izhikevich model — canonical phenomenological form\n"
+             "dv/dt = 0.04v² + 5v + 140 − u + I", fontsize=11)
 plt.tight_layout()
-plt.savefig("plots/05_izhikevich_firing_patterns.png", dpi=150)
-plt.show()
-
-
-# ── Side-by-side comparison ───────────────────────────────────────────────────
-t_iz, v_iz, _, _ = izhikevich(0.02, 0.2, -65, 8, I_ext=10, T=100)
-
-fig, axes = plt.subplots(2, 1, figsize=(11, 5), sharex=True)
-axes[0].plot(t, V_hh, "k", lw=1.2, label="Hodgkin–Huxley (4D)")
+fig.savefig("plots/05_izhikevich_firing_patterns.png", dpi=150); plt.close(fig)
+print("→ saved 05_izhikevich_firing_patterns.png")
+ 
+ 
+# =============================================================================
+# Section 8 — Three-way comparison: HH  |  2D reduced  |  Izhikevich RS
+# =============================================================================
+t_iz, v_iz, _, spks_iz = izhikevich(0.02, 0.2, -65, 8, I_ext=10, T=100)
+n_spk_iz = len(spks_iz)
+print(f"\n[Izhikevich RS]  spikes = {n_spk_iz}")
+ 
+fig, axes = plt.subplots(3, 1, figsize=(11,7), sharex=True)
+ 
+axes[0].plot(t, V_hh, C_HH, lw=1.3)
 axes[0].set_ylabel("V (mV)")
-axes[0].legend(loc="upper right")
+axes[0].set_title(f"Full Hodgkin–Huxley  (4D)   —  {n_spk_hh} spikes")
 axes[0].set_ylim(-85, 60)
-
-axes[1].plot(t_iz, v_iz, color="firebrick", lw=1.2,
-             label=f"Izhikevich — derived  "
-                   f"(a2 = {a2:.3f},  a1 = {a1:.3f},  a0 = {a0:.2f})")
-axes[1].set_ylabel("v (mV)")
-axes[1].set_xlabel("Time (ms)")
-axes[1].legend(loc="upper right")
+ 
+axes[1].plot(t, V_2d, C_2D, lw=1.3)
+axes[1].set_ylabel("V (mV)")
+axes[1].set_title(f"2D reduced  (m=m∞, h=φ(n))  —  {n_spk_2d} spikes")
 axes[1].set_ylim(-85, 60)
-
-fig.suptitle("HH vs. Izhikevich Derived from HH Nullcline Fit", fontsize=11)
+ 
+axes[2].plot(t_iz, v_iz, C_IZH, lw=1.3)
+axes[2].set_ylabel("v (mV)")
+axes[2].set_xlabel("Time (ms)")
+axes[2].set_title(f"Izhikevich RS  (phenomenological 2D)  —  {n_spk_iz} spikes")
+axes[2].set_ylim(-85, 60)
+ 
+fig.suptitle("Three-way comparison: HH  →  2D reduced  →  Izhikevich", fontsize=12)
 plt.tight_layout()
-plt.savefig("plots/06_hh_vs_izhikevich.png", dpi=150)
-plt.show()
-
-
+fig.savefig("plots/06_three_way_comparison.png", dpi=150); plt.close(fig)
+print("→ saved 06_three_way_comparison.png")
+ 
+ 
 # =============================================================================
-# Section 7 — Summary of the Derivation
+# Section 9 — Derivation summary
 # =============================================================================
-
-print("\n" + "=" * 58)
-print("DERIVATION SUMMARY")
-print("=" * 58)
-print(f"{'Step':<38} {'Dimension':>9}")
-print("-" * 58)
-print(f"{'Full Hodgkin-Huxley model':<38} {'4D':>9}")
-print(f"{'Quasi-static m → m_∞(V)':<38} {'3D':>9}")
-print(f"{'Rinzel reduction: h ≈ φ(n)':<38} {'2D':>9}")
-print(f"{'Taylor expansion at bifurcation':<38} {'2D':>9}")
-print("-" * 58)
-print(f"\nFitted nullcline (HH units):")
-print(f"  u = {c0:.2f} + {c1:.4f}·V + {c2:.4f}·V²    R² = {R2:.4f}")
-print(f"\nRescaled (Izhikevich units):")
-print(f"  u = {a0:.2f} + {a1:.4f}·v + {a2:.4f}·v²")
-print(f"\nCanonical Izhikevich:")
-print(f"  u = 140 + 5·v + 0.04·v²")
-print("=" * 58)
-print("\nPlots saved to:  plots/")
+print("\n" + "="*62)
+print("REDUCTION PIPELINE SUMMARY")
+print("="*62)
+print(f"  {'Step':<40} {'Dim':>4}  {'Method'}")
+print("  " + "-"*58)
+print(f"  {'Full Hodgkin-Huxley  (V, m, h, n)':<40} {'4D':>4}  —")
+print(f"  {'Quasi-static: m → m_∞(V)':<40} {'3D':>4}  τ_m ≪ τ_h, τ_n")
+rinzel_label = f"Rinzel: h ≈ {h_slope:.3f}·n + {h_int:.3f}  (R²={R2_hn:.3f})"
+print(f"  {rinzel_label:<40} {'2D':>4}  linear fit on HH orbit")
+print("  " + "-"*58)
+print(f"\n  V-nullcline quadratic fit R² = {R2_Vnull:.3f}")
+print(f"  → S-shaped curve: parabola is insufficient")
+print(f"  → Izhikevich parabola (0.04v²+5v+140) is phenomenological")
+print(f"\n  2D reduced spikes : {n_spk_2d}  (full HH: {n_spk_hh})")
+print("="*62)
+print("\nAll plots saved to  plots/")
+ 
